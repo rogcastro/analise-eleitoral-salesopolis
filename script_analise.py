@@ -59,18 +59,50 @@ def remover_acentos(texto):
     nfkd = unicodedata.normalize('NFKD', texto)
     return "".join([c for c in nfkd if not unicodedata.combining(c)])
 
+def obter_coluna_municipio(df):
+    cols = [str(c).upper().strip() for c in df.columns]
+    
+    # 1. Testar NM_MUNICIPIO (excluindo NASCIMENTO) se contiver Salesópolis
+    muni_cols = [c for c in cols if ('NM_MUNICIPIO' in c or 'NOME_MUNICIPIO' in c) and 'NASCIMENTO' not in c]
+    if muni_cols:
+        col = muni_cols[0]
+        val_norm = df[col].astype(str).apply(remover_acentos).str.upper().str.strip()
+        if (val_norm == 'SALESOPOLIS').any():
+            return col
+
+    # 2. Testar NM_UE caso a circunscrição tenha Salesópolis (ex: candidatos a prefeito/vereador)
+    ue_cols = [c for c in cols if c in ['NM_UE', 'NOME_UE']]
+    if ue_cols:
+        col = ue_cols[0]
+        val_norm = df[col].astype(str).apply(remover_acentos).str.upper().str.strip()
+        if (val_norm == 'SALESOPOLIS').any():
+            return col
+
+    # Fallback
+    for c in cols:
+        if 'MUNICIPIO' in c and 'NASCIMENTO' not in c:
+            return c
+    return ue_cols[0] if ue_cols else None
+
+def eh_candidato_eleito(status):
+    if not isinstance(status, str):
+        return False
+    st = remover_acentos(status).upper().strip()
+    if 'NAO' in st or 'INAPTO' in st or 'SUPLENTE' in st:
+        return False
+    return st.startswith('ELEITO') or 'ELEITO POR' in st or st in ['ELEITO', 'MEDIA', 'MÉDIA']
+
 def identificar_grupo_cargo(row):
-    # Identificação por CD_CARGO (código numérico TSE)
     col_cd = [c for c in row.index if 'CD_CARGO' in c]
     if col_cd and pd.notnull(row[col_cd[0]]):
         try:
             cd = int(row[col_cd[0]])
-            if cd == 11:
+            if cd == 1:
+                return 'Presidente', 'Presidente'
+            elif cd == 11:
                 return 'Prefeitos', 'Prefeito'
             elif cd == 13:
                 return 'Vereadores', 'Vereador'
-            elif cd == 1:
-                return 'Presidente', 'Presidente'
             elif cd == 3:
                 return 'Governadores', 'Governador'
             elif cd == 5:
@@ -82,16 +114,15 @@ def identificar_grupo_cargo(row):
         except:
             pass
 
-    # Identificação por texto
     col_ds = [c for c in row.index if 'DS_CARGO' in c or 'DESCRICAO_CARGO' in c]
     if col_ds and pd.notnull(row[col_ds[0]]):
         txt = remover_acentos(str(row[col_ds[0]])).upper().strip()
-        if 'PREFEITO' in txt:
+        if 'PRESIDENTE' in txt:
+            return 'Presidente', 'Presidente'
+        elif 'PREFEITO' in txt:
             return 'Prefeitos', 'Prefeito'
         elif 'VEREADOR' in txt:
             return 'Vereadores', 'Vereador'
-        elif 'PRESIDENTE' in txt:
-            return 'Presidente', 'Presidente'
         elif 'GOVERNADOR' in txt:
             return 'Governadores', 'Governador'
         elif 'SENADOR' in txt:
@@ -210,8 +241,11 @@ def processar_eleicoes():
     for arq in arquivos:
         arq_lower = arq.lower()
         
-        if arq_lower.endswith('_br.csv') or ('presidente' in arq_lower and not arq_lower.startswith('presidente_salesopolis_')):
+        # Ignora arquivos originais gigantes terminados em _BR.csv
+        if arq_lower.endswith('_br.csv'):
             continue
+            
+        is_presidente = 'presidente' in arq_lower
 
         caminho = os.path.join(caminho_brutos, arq)
         print(f"Lendo: {arq}...")
@@ -219,23 +253,23 @@ def processar_eleicoes():
             df = pd.read_csv(caminho, encoding='latin-1', sep=';', low_memory=False)
             df.columns = [str(c).upper().strip() for c in df.columns]
 
-            if arq_lower.startswith('presidente_salesopolis_'):
+            if is_presidente:
                 df['DS_CARGO'] = 'Presidente'
                 df['CD_CARGO'] = 1
 
-            col_muni_pref = [c for c in df.columns if 'NM_MUNICIPIO' in c or 'NOME_MUNICIPIO' in c]
-            if col_muni_pref:
-                col_muni = col_muni_pref[0]
-            elif 'NM_UE' in df.columns:
-                col_muni = 'NM_UE'
-            else:
+            col_muni = obter_coluna_municipio(df)
+            if not col_muni:
+                print(f"  └─ AVISO: Coluna de município não encontrada em {arq}.")
                 continue
 
             muni_norm = df[col_muni].astype(str).apply(remover_acentos).str.upper().str.strip()
             df_sales = df[muni_norm == 'SALESOPOLIS'].copy()
 
             if df_sales.empty:
+                print(f"  └─ Nenhum registro para SALESOPOLIS em {arq}.")
                 continue
+
+            print(f"  └─ Sucesso! {len(df_sales)} registros para SALESOPOLIS em {arq}.")
 
             if 'candidato' in arq_lower or 'cand' in arq_lower:
                 list_cand.append(df_sales)
@@ -250,6 +284,7 @@ def processar_eleicoes():
 
     cand_por_partido = pd.DataFrame()
     cand_espectro_pct = pd.DataFrame()
+    eleitos_por_partido = pd.DataFrame()
     eleitos_espectro_pct = pd.DataFrame()
 
     if not df_cand_total.empty:
@@ -276,10 +311,14 @@ def processar_eleicoes():
                 col_sit = [c for c in df_muni_cand.columns if 'DS_SIT_TOT_TURNO' in c or 'DS_SITUACAO_TSE' in c]
                 if col_sit:
                     sit_col = col_sit[0]
-                    mask_eleito = df_muni_cand[sit_col].astype(str).str.upper().str.startswith('ELEITO')
+                    mask_eleito = df_muni_cand[sit_col].apply(eh_candidato_eleito)
                     df_eleitos = df_muni_cand[mask_eleito].drop_duplicates(subset=[col_ano, col_cargo, id_cand])
 
                     if not df_eleitos.empty:
+                        eleitos_por_partido = df_eleitos.groupby([col_ano, col_cargo, 'SG_PARTIDO_LIMP', 'ESPECTRO']).size().reset_index(name='QTD_ELEITOS')
+                        tot_eleitos = eleitos_por_partido.groupby([col_ano, col_cargo])['QTD_ELEITOS'].transform('sum')
+                        eleitos_por_partido['%_ELEITOS'] = (eleitos_por_partido['QTD_ELEITOS'] / tot_eleitos) * 100
+
                         eleitos_abs = df_eleitos.groupby([col_ano, col_cargo, 'ESPECTRO']).size().unstack(fill_value=0)
                         eleitos_espectro_pct = eleitos_abs.div(eleitos_abs.sum(axis=1), axis=0) * 100
 
@@ -293,20 +332,21 @@ def processar_eleicoes():
             matriz_votos.to_excel(writer, sheet_name='Matriz_Votos_Salesopolis')
         if not votos_espectro_pct.empty:
             votos_espectro_pct.to_excel(writer, sheet_name='Votos_Espectro_%')
-        if not eleitos_espectro_pct.empty:
-            eleitos_espectro_pct.to_excel(writer, sheet_name='Eleitos_Espectro_%')
+        if not eleitos_por_partido.empty:
+            eleitos_por_partido.to_excel(writer, sheet_name='Eleitos_Por_Partido', index=False)
         if not cand_por_partido.empty:
             cand_por_partido.to_excel(writer, sheet_name='Candidatos_Por_Partido', index=False)
             cand_espectro_pct.to_excel(writer, sheet_name='Candidatos_Espectro_%')
 
     print(f"\n✅ Planilha gerada com sucesso em: {caminho_excel}")
 
+    # ===================================================================
+    # GERAÇÃO DOS 4 GRÁFICOS
+    # ===================================================================
     os.makedirs(caminho_graficos, exist_ok=True)
     cores = {'Esquerda': '#d62728', 'Centro-Direita': '#1f77b4', 'Outros': '#7f7f7f'}
 
-    # -------------------------------------------------------------------
     # 1. Gráfico Geral Único
-    # -------------------------------------------------------------------
     if not votos_espectro_pct.empty:
         try:
             labels_formatados = [f"{idx[0]} - {idx[1]}" if isinstance(idx, tuple) else str(idx) for idx in votos_espectro_pct.index]
@@ -329,13 +369,11 @@ def processar_eleicoes():
             caminho_img_votos = os.path.join(caminho_graficos, 'grafico_votos_espectro.png')
             plt.savefig(caminho_img_votos, dpi=300, bbox_inches='tight')
             plt.close('all')
-            print(f"✅ Gráfico Geral de Votos salvo em: {caminho_img_votos}")
+            print(f"✅ 1/4 - Gráfico Geral de Votos salvo em: {caminho_img_votos}")
         except Exception as e:
-            print(f"⚠️ Aviso ao salvar gráfico geral: {e}")
+            print(f"⚠️ Aviso ao salvar gráfico 1: {e}")
 
-    # -------------------------------------------------------------------
     # 2. Gráfico Comparativo Facetado por TODOS OS CARGOS (3x2)
-    # -------------------------------------------------------------------
     if not votos_cargos_pct.empty:
         try:
             fig, axes = plt.subplots(3, 2, figsize=(16, 14), sharey=True)
@@ -379,13 +417,11 @@ def processar_eleicoes():
             caminho_comp = os.path.join(caminho_graficos, 'grafico_comparativo_cargos.png')
             plt.savefig(caminho_comp, dpi=300, bbox_inches='tight')
             plt.close('all')
-            print(f"✅ Gráfico Comparativo Completo de Cargos salvo em: {caminho_comp}")
+            print(f"✅ 2/4 - Gráfico Comparativo Completo de Cargos salvo em: {caminho_comp}")
         except Exception as e:
-            print(f"⚠️ Aviso ao salvar gráfico comparativo de cargos: {e}")
+            print(f"⚠️ Aviso ao salvar gráfico 2: {e}")
 
-    # -------------------------------------------------------------------
-    # 3. Gráfico de Eleitos por Espectro
-    # -------------------------------------------------------------------
+    # 3. Gráfico de Eleitos por Espectro Político
     if not eleitos_espectro_pct.empty:
         try:
             labels_eleitos = [f"{idx[0]} - {idx[1]}" if isinstance(idx, tuple) else str(idx) for idx in eleitos_espectro_pct.index]
@@ -408,9 +444,36 @@ def processar_eleicoes():
             path_eleitos = os.path.join(caminho_graficos, 'grafico_eleitos_espectro.png')
             plt.savefig(path_eleitos, dpi=300, bbox_inches='tight')
             plt.close('all')
-            print(f"✅ Gráfico de Candidatos Eleitos salvo em: {path_eleitos}")
+            print(f"✅ 3/4 - Gráfico de Candidatos Eleitos salvo em: {path_eleitos}")
         except Exception as e:
-            print(f"⚠️ Aviso ao salvar gráfico de eleitos: {e}")
+            print(f"⚠️ Aviso ao salvar gráfico 3: {e}")
+
+    # 4. Gráfico de Candidatos Inscritos por Espectro Político
+    if not cand_espectro_pct.empty:
+        try:
+            labels_cand = [f"{idx[0]} - {idx[1]}" if isinstance(idx, tuple) else str(idx) for idx in cand_espectro_pct.index]
+            largura_cand = max(10, len(cand_espectro_pct) * 0.5)
+            fig, ax = plt.subplots(figsize=(largura_cand, 6))
+
+            cols_cand = [c for c in ['Esquerda', 'Centro-Direita', 'Outros'] if c in cand_espectro_pct.columns]
+            cand_espectro_pct[cols_cand].plot(kind='bar', stacked=True, color=[cores[c] for c in cols_cand], ax=ax, width=0.6)
+            
+            plt.title('Espectro Político dos CANDIDATOS INSCRITOS (Salesópolis)', fontsize=14, fontweight='bold', pad=15)
+            plt.xlabel('Ano - Cargo', fontsize=11, labelpad=10)
+            plt.ylabel('Proporção de Candidatos Inscritos (%)', fontsize=11)
+            plt.legend(title='Espectro Político', bbox_to_anchor=(1.01, 1), loc='upper left')
+            ax.set_xticks(range(len(labels_cand)))
+            ax.set_xticklabels(labels_cand, rotation=45, ha='right', fontsize=9)
+            plt.ylim(0, 100)
+            plt.grid(axis='y', linestyle='--', alpha=0.5)
+            plt.tight_layout()
+
+            path_cand = os.path.join(caminho_graficos, 'grafico_candidatos_espectro.png')
+            plt.savefig(path_cand, dpi=300, bbox_inches='tight')
+            plt.close('all')
+            print(f"✅ 4/4 - Gráfico de Candidatos Inscritos salvo em: {path_cand}")
+        except Exception as e:
+            print(f"⚠️ Aviso ao salvar gráfico 4: {e}")
 
 if __name__ == '__main__':
     processar_eleicoes()
